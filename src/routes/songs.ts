@@ -17,6 +17,11 @@ function getSupabaseWithAuth(req: AuthRequest) {
   });
 }
 
+// =============================================
+// SPECIFIC ROUTES (must come before /:id routes)
+// =============================================
+
+// GET /api/songs - List user's songs
 router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { data, error } = await supabase
@@ -35,28 +40,128 @@ router.get('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
-router.get('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+// GET /api/songs/shared - Get songs shared with current user
+router.get('/shared', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
   try {
-    const { data, error } = await supabase
-      .from('songs')
-      .select('*')
-      .eq('id', req.params.id)
-      .single();
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    const { data, error } = await supabaseAuth
+      .from('collaborators')
+      .select(`
+        permission,
+        songs (*)
+      `)
+      .eq('user_id', req.userId);
 
     if (error) {
-      return res.status(404).json({ error: 'Song not found' });
+      return res.status(400).json({ error: error.message });
     }
 
-    if (data.owner_id !== req.userId && !data.is_public) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    const songs = (data || []).map((item: any) => ({
+      ...item.songs,
+      collaborator_permission: item.permission,
+      is_collaborator: true,
+    }));
 
-    return res.json(data);
+    return res.json(songs);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
 });
 
+// GET /api/songs/public/list - List public songs
+router.get('/public/list', async (req: AuthRequest, res: Response) => {
+  try {
+    const { genre, key, sort, limit = 20, offset = 0 } = req.query;
+    
+    let query = supabase
+      .from('songs')
+      .select('id, title, artist, original_key, genre, tempo, owner_id, created_at, updated_at')
+      .eq('is_public', true);
+
+    if (genre) {
+      query = query.eq('genre', genre as string);
+    }
+    if (key) {
+      query = query.eq('original_key', key as string);
+    }
+
+    if (sort === 'popular') {
+      query = query.order('created_at', { ascending: false });
+    } else {
+      query = query.order('created_at', { ascending: false });
+    }
+
+    query = query.range(Number(offset), Number(offset) + Number(limit) - 1);
+
+    const { data, error } = await query;
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/share/:token - Access song via share token
+router.get('/share/:token', async (req: AuthRequest, res: Response) => {
+  try {
+    const { data: shareToken, error } = await supabase
+      .from('share_tokens')
+      .select('*, songs(*)')
+      .eq('token', req.params.token)
+      .single();
+
+    if (error || !shareToken) {
+      return res.status(404).json({ error: 'Invalid share link' });
+    }
+
+    if (shareToken.expires_at && new Date(shareToken.expires_at) < new Date()) {
+      return res.status(410).json({ error: 'Share link expired' });
+    }
+
+    return res.json({
+      song: shareToken.songs,
+      requiresAccessCode: !!shareToken.access_code,
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/share/:token/access - Verify access code
+router.post('/share/:token/access', async (req: AuthRequest, res: Response) => {
+  const { access_code } = req.body;
+
+  try {
+    const { data: shareToken, error } = await supabase
+      .from('share_tokens')
+      .select('*, songs(*)')
+      .eq('token', req.params.token)
+      .single();
+
+    if (error || !shareToken) {
+      return res.status(404).json({ error: 'Invalid share link' });
+    }
+
+    if (shareToken.access_code && shareToken.access_code !== access_code) {
+      return res.status(403).json({ error: 'Invalid access code' });
+    }
+
+    return res.json({ song: shareToken.songs });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/songs - Create new song
 router.post('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   const { title, content, artist, original_key, tempo, genre, is_public } = req.body;
 
@@ -90,6 +195,163 @@ router.post('/', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
+// =============================================
+// PARAMETERIZED ROUTES /:id (come after specific routes)
+// =============================================
+
+// GET /api/songs/:id - Get song by ID
+router.get('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+  try {
+    const { data, error } = await supabase
+      .from('songs')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    if (data.owner_id !== req.userId && !data.is_public) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    return res.json(data);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/songs/:id/public - Get public song (no auth required)
+router.get('/:id/public', async (req: AuthRequest, res: Response) => {
+  try {
+    const { data, error } = await supabase
+      .from('songs')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    if (!data.is_public) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    const { data: ownerProfile } = await supabase
+      .from('profiles')
+      .select('username, avatar_url')
+      .eq('id', data.owner_id)
+      .single();
+
+    return res.json({
+      ...data,
+      owner_username: ownerProfile?.username || 'Unknown',
+      owner_avatar: ownerProfile?.avatar_url || null,
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/songs/:id/fork - Create a copy of a song
+router.post('/:id/fork', authMiddleware, async (req: AuthRequest, res: Response) => {
+  const { title, content, original_key } = req.body;
+
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const { data: originalSong, error: fetchError } = await supabase
+      .from('songs')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError || !originalSong) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    if (originalSong.owner_id !== req.userId && !originalSong.is_public) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { data, error } = await supabase
+      .from('songs')
+      .insert({
+        title: title || `${originalSong.title} (Copia)`,
+        content: content || originalSong.content,
+        artist: originalSong.artist,
+        original_key: original_key || originalSong.original_key,
+        tempo: originalSong.tempo,
+        genre: originalSong.genre,
+        is_public: false,
+        owner_id: req.userId,
+        parent_song_id: originalSong.id,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.status(201).json(data);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/songs/:id/public/fork - Fork a public song
+router.post('/:id/public/fork', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const { data: originalSong, error: fetchError } = await supabase
+      .from('songs')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchError || !originalSong) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    if (!originalSong.is_public) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { data, error } = await supabase
+      .from('songs')
+      .insert({
+        title: `${originalSong.title} (Copia)`,
+        content: originalSong.content,
+        artist: originalSong.artist,
+        original_key: originalSong.original_key,
+        tempo: originalSong.tempo,
+        genre: originalSong.genre,
+        is_public: false,
+        owner_id: req.userId,
+        parent_song_id: originalSong.id,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.status(201).json(data);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/songs/:id - Update song
 router.put('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   const { title, content, artist, original_key, tempo, genre, is_public } = req.body;
 
@@ -134,6 +396,7 @@ router.put('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   }
 });
 
+// DELETE /api/songs/:id - Delete song
 router.delete('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   try {
     const { data: existingSong, error: fetchError } = await supabase
@@ -157,180 +420,6 @@ router.delete('/:id', authMiddleware, async (req: AuthRequest, res: Response) =>
     }
 
     return res.json({ message: 'Song deleted successfully' });
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// POST /api/songs/:id/fork - Create a copy of a song
-router.post('/:id/fork', authMiddleware, async (req: AuthRequest, res: Response) => {
-  const { title, content, original_key } = req.body;
-
-  if (!req.userId) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    // Get the original song
-    const { data: originalSong, error: fetchError } = await supabase
-      .from('songs')
-      .select('*')
-      .eq('id', req.params.id)
-      .single();
-
-    if (fetchError || !originalSong) {
-      return res.status(404).json({ error: 'Song not found' });
-    }
-
-    // Check access (owner or public)
-    if (originalSong.owner_id !== req.userId && !originalSong.is_public) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    // Create the fork
-    const { data, error } = await supabase
-      .from('songs')
-      .insert({
-        title: title || `${originalSong.title} (Copia)`,
-        content: content || originalSong.content,
-        artist: originalSong.artist,
-        original_key: original_key || originalSong.original_key,
-        tempo: originalSong.tempo,
-        genre: originalSong.genre,
-        is_public: false,
-        owner_id: req.userId,
-        parent_song_id: originalSong.id,
-      })
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    return res.status(201).json(data);
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// =============================================
-// PUBLIC ENDPOINTS (no auth required)
-// =============================================
-
-// GET /api/songs/public - List public songs (for exploration)
-router.get('/public/list', async (req: AuthRequest, res: Response) => {
-  try {
-    const { genre, key, sort, limit = 20, offset = 0 } = req.query;
-    
-    let query = supabase
-      .from('songs')
-      .select('id, title, artist, original_key, genre, tempo, owner_id, created_at, updated_at')
-      .eq('is_public', true);
-
-    if (genre) {
-      query = query.eq('genre', genre as string);
-    }
-    if (key) {
-      query = query.eq('original_key', key as string);
-    }
-
-    if (sort === 'popular') {
-      query = query.order('created_at', { ascending: false });
-    } else {
-      query = query.order('created_at', { ascending: false });
-    }
-
-    query = query.range(Number(offset), Number(offset) + Number(limit) - 1);
-
-    const { data, error } = await query;
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    return res.json(data || []);
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// GET /api/songs/:id/public - Get public song (no auth required)
-router.get('/:id/public', async (req: AuthRequest, res: Response) => {
-  try {
-    const { data, error } = await supabase
-      .from('songs')
-      .select('*')
-      .eq('id', req.params.id)
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: 'Song not found' });
-    }
-
-    if (!data.is_public) {
-      return res.status(404).json({ error: 'Song not found' });
-    }
-
-    // Get owner profile
-    const { data: ownerProfile } = await supabase
-      .from('profiles')
-      .select('username, avatar_url')
-      .eq('id', data.owner_id)
-      .single();
-
-    return res.json({
-      ...data,
-      owner_username: ownerProfile?.username || 'Unknown',
-      owner_avatar: ownerProfile?.avatar_url || null,
-    });
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// GET /api/songs/:id/public/fork - Fork a public song (auth required)
-router.post('/:id/public/fork', authMiddleware, async (req: AuthRequest, res: Response) => {
-  if (!req.userId) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    const { data: originalSong, error: fetchError } = await supabase
-      .from('songs')
-      .select('*')
-      .eq('id', req.params.id)
-      .single();
-
-    if (fetchError || !originalSong) {
-      return res.status(404).json({ error: 'Song not found' });
-    }
-
-    if (!originalSong.is_public) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    const { data, error } = await supabase
-      .from('songs')
-      .insert({
-        title: `${originalSong.title} (Copia)`,
-        content: originalSong.content,
-        artist: originalSong.artist,
-        original_key: originalSong.original_key,
-        tempo: originalSong.tempo,
-        genre: originalSong.genre,
-        is_public: false,
-        owner_id: req.userId,
-        parent_song_id: originalSong.id,
-      })
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    return res.status(201).json(data);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -461,57 +550,6 @@ router.delete('/:id/share/:tokenId', authMiddleware, async (req: AuthRequest, re
     }
 
     return res.json({ message: 'Share token deleted' });
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// GET /api/share/:token - Access song via share token
-router.get('/share/:token', async (req: AuthRequest, res: Response) => {
-  try {
-    const { data: shareToken, error } = await supabase
-      .from('share_tokens')
-      .select('*, songs(*)')
-      .eq('token', req.params.token)
-      .single();
-
-    if (error || !shareToken) {
-      return res.status(404).json({ error: 'Invalid share link' });
-    }
-
-    if (shareToken.expires_at && new Date(shareToken.expires_at) < new Date()) {
-      return res.status(410).json({ error: 'Share link expired' });
-    }
-
-    return res.json({
-      song: shareToken.songs,
-      requiresAccessCode: !!shareToken.access_code,
-    });
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// POST /api/share/:token/access - Verify access code
-router.post('/share/:token/access', async (req: AuthRequest, res: Response) => {
-  const { access_code } = req.body;
-
-  try {
-    const { data: shareToken, error } = await supabase
-      .from('share_tokens')
-      .select('*, songs(*)')
-      .eq('token', req.params.token)
-      .single();
-
-    if (error || !shareToken) {
-      return res.status(404).json({ error: 'Invalid share link' });
-    }
-
-    if (shareToken.access_code && shareToken.access_code !== access_code) {
-      return res.status(403).json({ error: 'Invalid access code' });
-    }
-
-    return res.json({ song: shareToken.songs });
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -650,43 +688,6 @@ router.delete('/:id/collaborators/:userId', authMiddleware, async (req: AuthRequ
 });
 
 // =============================================
-// SHARED SONGS ENDPOINT
-// =============================================
-
-// GET /api/songs/shared - Get songs shared with current user
-router.get('/shared', authMiddleware, async (req: AuthRequest, res: Response) => {
-  if (!req.userId) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    const supabaseAuth = getSupabaseWithAuth(req);
-    
-    const { data, error } = await supabaseAuth
-      .from('collaborators')
-      .select(`
-        permission,
-        songs (*)
-      `)
-      .eq('user_id', req.userId);
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    const songs = (data || []).map((item: any) => ({
-      ...item.songs,
-      collaborator_permission: item.permission,
-      is_collaborator: true,
-    }));
-
-    return res.json(songs);
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// =============================================
 // COMMENTS ENDPOINTS
 // =============================================
 
@@ -760,8 +761,8 @@ router.post('/:id/comments', authMiddleware, async (req: AuthRequest, res: Respo
   }
 });
 
-// DELETE /api/comments/:id - Delete a comment
-router.delete('/comments/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
+// DELETE /api/songs/:id/comments/:commentId - Delete a comment
+router.delete('/:id/comments/:commentId', authMiddleware, async (req: AuthRequest, res: Response) => {
   if (!req.userId) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -772,7 +773,7 @@ router.delete('/comments/:id', authMiddleware, async (req: AuthRequest, res: Res
     const { data: comment, error: fetchError } = await supabaseAuth
       .from('comments')
       .select('user_id')
-      .eq('id', req.params.id)
+      .eq('id', req.params.commentId)
       .single();
 
     if (fetchError || !comment) {
@@ -786,7 +787,7 @@ router.delete('/comments/:id', authMiddleware, async (req: AuthRequest, res: Res
     const { error } = await supabaseAuth
       .from('comments')
       .delete()
-      .eq('id', req.params.id);
+      .eq('id', req.params.commentId);
 
     if (error) {
       return res.status(400).json({ error: error.message });
