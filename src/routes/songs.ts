@@ -886,4 +886,78 @@ router.post('/:id/activity', authMiddleware, async (req: AuthRequest, res: Respo
   }
 });
 
+// =============================================
+// STATISTICS ENDPOINTS
+// =============================================
+
+// POST /api/songs/:id/view - Increment view count
+router.post('/:id/view', async (req: AuthRequest, res: Response) => {
+  try {
+    const { data: song, error: songError } = await supabase
+      .from('songs')
+      .select('view_count')
+      .eq('id', req.params.id)
+      .single();
+
+    if (songError || !song) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    const newCount = (song.view_count || 0) + 1;
+
+    await supabase
+      .from('songs')
+      .update({ view_count: newCount })
+      .eq('id', req.params.id);
+
+    return res.json({ success: true, view_count: newCount });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/songs/:id/stats - Get song statistics
+router.get('/:id/stats', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    const { data: song, error: songError } = await supabaseAuth
+      .from('songs')
+      .select('owner_id, view_count, share_count')
+      .eq('id', req.params.id)
+      .single();
+
+    if (songError || !song) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    if (song.owner_id !== req.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { data: commentsCount } = await supabase
+      .from('comments')
+      .select('id', { count: 'exact', head: true })
+      .eq('song_id', req.params.id);
+
+    const { data: collaboratorsCount } = await supabase
+      .from('collaborators')
+      .select('id', { count: 'exact', head: true })
+      .eq('song_id', req.params.id);
+
+    return res.json({
+      view_count: song.view_count || 0,
+      share_count: song.share_count || 0,
+      comments_count: commentsCount || 0,
+      collaborators_count: collaboratorsCount || 0,
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 export default router;
