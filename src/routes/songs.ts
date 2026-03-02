@@ -582,16 +582,28 @@ router.get('/:id/collaborators', authMiddleware, async (req: AuthRequest, res: R
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { data, error } = await supabaseAuth
+    const { data: collaborators, error } = await supabaseAuth
       .from('collaborators')
-      .select('*, profiles(username, avatar_url)')
+      .select('*')
       .eq('song_id', req.params.id);
 
     if (error) {
       return res.status(400).json({ error: error.message });
     }
 
-    return res.json(data || []);
+    // Fetch profiles separately
+    const collaboratorsWithProfiles = await Promise.all(
+      (collaborators || []).map(async (collab) => {
+        const { data: profile } = await supabaseAuth
+          .from('profiles')
+          .select('username, avatar_url')
+          .eq('id', collab.user_id)
+          .single();
+        return { ...collab, profiles: profile };
+      })
+    );
+
+    return res.json(collaboratorsWithProfiles);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -599,7 +611,7 @@ router.get('/:id/collaborators', authMiddleware, async (req: AuthRequest, res: R
 
 // POST /api/songs/:id/collaborators - Add collaborator
 router.post('/:id/collaborators', authMiddleware, async (req: AuthRequest, res: Response) => {
-  const { user_id, permission = 'read' } = req.body;
+  const { user_id, permission = 'read', email } = req.body;
   const supabaseAuth = getSupabaseWithAuth(req);
 
   if (!req.userId) {
@@ -626,11 +638,50 @@ router.post('/:id/collaborators', authMiddleware, async (req: AuthRequest, res: 
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    let collaboratorUserId = user_id;
+
+    if (email && !user_id) {
+      // Search by username in profiles table
+      const { data: profile, error: profileError } = await supabaseAuth
+        .from('profiles')
+        .select('id, username')
+        .ilike('username', `%${email}%`)
+        .limit(10);
+
+      console.log('Search profiles:', profile, profileError);
+
+      if (!profile || profile.length === 0) {
+        return res.status(400).json({ 
+          error: 'Usuario no encontrado. Busca por username en la tabla profiles.' 
+        });
+      }
+
+      // If exact match
+      const exactMatch = profile.find(p => p.username.toLowerCase() === email.toLowerCase());
+      if (exactMatch) {
+        collaboratorUserId = exactMatch.id;
+      } else {
+        // Return suggestions
+        const suggestions = profile.map(p => p.username).join(', ');
+        return res.status(400).json({ 
+          error: `Usuario no encontrado. ¿Quisiste decir alguno de estos?: ${suggestions}` 
+        });
+      }
+    }
+
+    if (!collaboratorUserId) {
+      return res.status(400).json({ error: 'Se requiere user_id o email' });
+    }
+
+    if (collaboratorUserId === song.owner_id) {
+      return res.status(400).json({ error: 'No puedes agregar al propietario como colaborador' });
+    }
+
     const { data, error } = await supabaseAuth
       .from('collaborators')
       .upsert({
         song_id: req.params.id,
-        user_id,
+        user_id: collaboratorUserId,
         permission,
       }, {
         onConflict: 'song_id,user_id',
@@ -710,9 +761,9 @@ router.get('/:id/comments', authMiddleware, async (req: AuthRequest, res: Respon
       return res.status(404).json({ error: 'Song not found' });
     }
 
-    const { data, error } = await supabaseAuth
+    const { data: comments, error } = await supabaseAuth
       .from('comments')
-      .select('*, profiles(username, avatar_url)')
+      .select('*')
       .eq('song_id', req.params.id)
       .order('created_at', { ascending: false });
 
@@ -720,7 +771,18 @@ router.get('/:id/comments', authMiddleware, async (req: AuthRequest, res: Respon
       return res.status(400).json({ error: error.message });
     }
 
-    return res.json(data || []);
+    const commentsWithProfiles = await Promise.all(
+      (comments || []).map(async (comment) => {
+        const { data: profile } = await supabaseAuth
+          .from('profiles')
+          .select('username, avatar_url')
+          .eq('id', comment.user_id)
+          .single();
+        return { ...comment, profiles: profile };
+      })
+    );
+
+    return res.json(commentsWithProfiles);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -741,21 +803,27 @@ router.post('/:id/comments', authMiddleware, async (req: AuthRequest, res: Respo
   try {
     const supabaseAuth = getSupabaseWithAuth(req);
     
-    const { data, error } = await supabaseAuth
+    const { data: comment, error } = await supabaseAuth
       .from('comments')
       .insert({
         song_id: req.params.id,
         user_id: req.userId,
         content: content.trim(),
       })
-      .select('*, profiles(username, avatar_url)')
+      .select()
       .single();
 
     if (error) {
       return res.status(400).json({ error: error.message });
     }
 
-    return res.status(201).json(data);
+    const { data: profile } = await supabaseAuth
+      .from('profiles')
+      .select('username, avatar_url')
+      .eq('id', req.userId)
+      .single();
+
+    return res.status(201).json({ ...comment, profiles: profile });
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
