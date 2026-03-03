@@ -196,6 +196,116 @@ router.post('/', authMiddleware, async (req: AuthRequest, res: Response) => {
 });
 
 // =============================================
+// NOTIFICATIONS ROUTES (before /:id to avoid conflict)
+// =============================================
+
+// GET /api/songs/notifications - Get current user's notifications
+router.get('/notifications', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  console.log('Fetching notifications for user:', req.userId);
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    const { data, error } = await supabaseAuth
+      .from('notifications')
+      .select('*')
+      .eq('user_id', req.userId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    console.log('Notifications data:', data, 'error:', error);
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.json(data || []);
+  } catch (error: any) {
+    console.error('Error fetching notifications:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/songs/notifications/unread-count - Get unread notification count
+router.get('/notifications/unread-count', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    const { count, error } = await supabaseAuth
+      .from('notifications')
+      .select('id', { count: 'exact', head: true })
+      .eq('user_id', req.userId)
+      .eq('is_read', false);
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.json({ count: count || 0 });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/songs/notifications/:id/read - Mark notification as read
+router.post('/notifications/:id/read', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    const { error } = await supabaseAuth
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('id', req.params.id)
+      .eq('user_id', req.userId);
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.json({ success: true });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/songs/notifications/read-all - Mark all notifications as read
+router.post('/notifications/read-all', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    const { error } = await supabaseAuth
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('user_id', req.userId)
+      .eq('is_read', false);
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.json({ success: true });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// =============================================
 // PARAMETERIZED ROUTES /:id (come after specific routes)
 // =============================================
 
@@ -693,6 +803,27 @@ router.post('/:id/collaborators', authMiddleware, async (req: AuthRequest, res: 
       return res.status(400).json({ error: error.message });
     }
 
+    // Get song title for notification
+    const { data: songData } = await supabaseAuth
+      .from('songs')
+      .select('title')
+      .eq('id', req.params.id)
+      .single();
+
+    // Create notification for the collaborator using RPC (bypasses RLS)
+    try {
+      await supabaseAuth
+        .rpc('create_notification', {
+          p_user_id: collaboratorUserId,
+          p_type: 'collaborator_added',
+          p_title: 'Agregado como colaborador',
+          p_message: `Fuiste agregado como colaborador en "${songData?.title || 'una canción'}"`,
+          p_link: `/songs/${req.params.id}/view`,
+        });
+    } catch (notifError) {
+      console.error('Error creating collaborator notification:', notifError);
+    }
+
     return res.status(201).json(data);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
@@ -803,6 +934,17 @@ router.post('/:id/comments', authMiddleware, async (req: AuthRequest, res: Respo
   try {
     const supabaseAuth = getSupabaseWithAuth(req);
     
+    // Get song owner
+    const { data: song } = await supabaseAuth
+      .from('songs')
+      .select('id, title, owner_id')
+      .eq('id', req.params.id)
+      .single();
+
+    if (!song) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
     const { data: comment, error } = await supabaseAuth
       .from('comments')
       .insert({
@@ -822,6 +964,25 @@ router.post('/:id/comments', authMiddleware, async (req: AuthRequest, res: Respo
       .select('username, avatar_url')
       .eq('id', req.userId)
       .single();
+
+    // Create notification for song owner (if not own comment)
+    if (song.owner_id !== req.userId) {
+      try {
+        // Use RPC to create notification (bypasses RLS)
+        const { data: notifData, error: notifError } = await supabaseAuth
+          .rpc('create_notification', {
+            p_user_id: song.owner_id,
+            p_type: 'comment',
+            p_title: 'Nuevo comentario',
+            p_message: `${profile?.username || 'Alguien'} comento en "${song.title}"`,
+            p_link: `/songs/${song.id}/view`,
+          });
+        
+        console.log('Notification created:', notifData, notifError);
+      } catch (notifError) {
+        console.error('Error creating notification:', notifError);
+      }
+    }
 
     return res.status(201).json({ ...comment, profiles: profile });
   } catch (error: any) {
@@ -1027,5 +1188,29 @@ router.get('/:id/stats', authMiddleware, async (req: AuthRequest, res: Response)
     return res.status(500).json({ error: error.message });
   }
 });
+
+// Helper function to create notification
+export async function createNotification(
+  supabaseAuth: any,
+  userId: string,
+  type: string,
+  title: string,
+  message: string,
+  link?: string
+) {
+  const { data, error } = await supabaseAuth
+    .from('notifications')
+    .insert({
+      user_id: userId,
+      type,
+      title,
+      message,
+      link,
+    })
+    .select()
+    .single();
+
+  return { data, error };
+}
 
 export default router;
