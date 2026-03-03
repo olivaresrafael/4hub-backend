@@ -461,6 +461,194 @@ router.post('/:id/public/fork', authMiddleware, async (req: AuthRequest, res: Re
   }
 });
 
+// =============================================
+// VERSIONS ENDPOINTS
+// =============================================
+
+// GET /api/songs/:id/versions - Get song version history
+router.get('/:id/versions', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    const { data: song, error: songError } = await supabaseAuth
+      .from('songs')
+      .select('owner_id')
+      .eq('id', req.params.id)
+      .single();
+
+    if (songError || !song) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    const isOwner = song.owner_id === req.userId;
+    
+    const { data: collab } = await supabaseAuth
+      .from('collaborators')
+      .select('permission')
+      .eq('song_id', req.params.id)
+      .eq('user_id', req.userId)
+      .single();
+
+    const canView = isOwner || (collab && ['edit', 'admin'].includes(collab.permission));
+
+    if (!canView) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { data, error } = await supabaseAuth
+      .from('song_versions')
+      .select('*, profiles(username)')
+      .eq('song_id', req.params.id)
+      .order('version_number', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/songs/:id/versions - Create a new version
+router.post('/:id/versions', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    // Get current song
+    const { data: song, error: songError } = await supabaseAuth
+      .from('songs')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (songError || !song) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    // Get latest version number
+    const { data: latestVersion } = await supabaseAuth
+      .from('song_versions')
+      .select('version_number')
+      .eq('song_id', req.params.id)
+      .order('version_number', { ascending: false })
+      .limit(1)
+      .single();
+
+    const newVersionNumber = (latestVersion?.version_number || 0) + 1;
+
+    const { data, error } = await supabaseAuth
+      .from('song_versions')
+      .insert({
+        song_id: req.params.id,
+        content: song.content,
+        title: song.title,
+        version_number: newVersionNumber,
+        created_by: req.userId,
+      })
+      .select('*, profiles(username)')
+      .single();
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.status(201).json(data);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/songs/:id/lineage - Get fork lineage (forks and parent)
+router.get('/:id/lineage', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    // Get the song
+    const { data: song, error: songError } = await supabaseAuth
+      .from('songs')
+      .select('*, owner:profiles(username)')
+      .eq('id', req.params.id)
+      .single();
+
+    if (songError || !song) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    // Check access
+    if (song.owner_id !== req.userId && !song.is_public) {
+      const { data: collab } = await supabaseAuth
+        .from('collaborators')
+        .select('permission')
+        .eq('song_id', req.params.id)
+        .eq('user_id', req.userId)
+        .single();
+
+      if (!collab) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    // Get parent song
+    let parent = null;
+    if (song.parent_song_id) {
+      const { data: parentSong } = await supabaseAuth
+        .from('songs')
+        .select('id, title, owner_id, profiles(username)')
+        .eq('id', song.parent_song_id)
+        .single();
+      parent = parentSong;
+    }
+
+    // Get child forks
+    const { data: forks } = await supabaseAuth
+      .from('songs')
+      .select('id, title, owner_id, created_at, profiles(username)')
+      .eq('parent_song_id', req.params.id)
+      .order('created_at', { ascending: false });
+
+    return res.json({
+      song,
+      parent,
+      forks: forks || [],
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/songs/:id/forks - Get forks of a song
+router.get('/:id/forks', async (req: AuthRequest, res: Response) => {
+  try {
+    const { data, error } = await supabase
+      .from('songs')
+      .select('id, title, owner_id, created_at, profiles(username)')
+      .eq('parent_song_id', req.params.id)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    return res.json(data || []);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 // PUT /api/songs/:id - Update song
 router.put('/:id', authMiddleware, async (req: AuthRequest, res: Response) => {
   const { title, content, artist, original_key, tempo, genre, is_public } = req.body;
