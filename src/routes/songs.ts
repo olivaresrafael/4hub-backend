@@ -374,7 +374,9 @@ router.post('/:id/fork', authMiddleware, async (req: AuthRequest, res: Response)
   }
 
   try {
-    const { data: originalSong, error: fetchError } = await supabase
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
+    const { data: originalSong, error: fetchError } = await supabaseAuth
       .from('songs')
       .select('*')
       .eq('id', req.params.id)
@@ -388,7 +390,7 @@ router.post('/:id/fork', authMiddleware, async (req: AuthRequest, res: Response)
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAuth
       .from('songs')
       .insert({
         title: title || `${originalSong.title} (Copia)`,
@@ -421,6 +423,8 @@ router.post('/:id/public/fork', authMiddleware, async (req: AuthRequest, res: Re
   }
 
   try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+    
     const { data: originalSong, error: fetchError } = await supabase
       .from('songs')
       .select('*')
@@ -435,7 +439,7 @@ router.post('/:id/public/fork', authMiddleware, async (req: AuthRequest, res: Re
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await supabaseAuth
       .from('songs')
       .insert({
         title: `${originalSong.title} (Copia)`,
@@ -501,7 +505,7 @@ router.get('/:id/versions', authMiddleware, async (req: AuthRequest, res: Respon
 
     const { data, error } = await supabaseAuth
       .from('song_versions')
-      .select('*, profiles(username)')
+      .select('*')
       .eq('song_id', req.params.id)
       .order('version_number', { ascending: false });
 
@@ -555,7 +559,7 @@ router.post('/:id/versions', authMiddleware, async (req: AuthRequest, res: Respo
         version_number: newVersionNumber,
         created_by: req.userId,
       })
-      .select('*, profiles(username)')
+      .select()
       .single();
 
     if (error) {
