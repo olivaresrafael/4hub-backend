@@ -80,7 +80,7 @@ router.get('/public/list', async (req: AuthRequest, res: Response) => {
     
     let query = supabase
       .from('songs')
-      .select('id, title, artist, original_key, genre, tempo, owner_id, created_at, updated_at')
+      .select('id, title, artist, original_key, genre, tempo, owner_id, parent_song_id, likes_count, view_count, created_at, updated_at')
       .eq('is_public', true);
 
     if (genre) {
@@ -91,20 +91,36 @@ router.get('/public/list', async (req: AuthRequest, res: Response) => {
     }
 
     if (sort === 'popular') {
-      query = query.order('created_at', { ascending: false });
+      query = query.order('likes_count', { ascending: false });
+    } else if (sort === 'views') {
+      query = query.order('view_count', { ascending: false });
     } else {
       query = query.order('created_at', { ascending: false });
     }
 
     query = query.range(Number(offset), Number(offset) + Number(limit) - 1);
 
-    const { data, error } = await query;
+    const { data: songs, error } = await query;
 
     if (error) {
       return res.status(400).json({ error: error.message });
     }
 
-    return res.json(data || []);
+    // Get owner usernames
+    const ownerIds = [...new Set(songs?.map(s => s.owner_id).filter(Boolean) || [])];
+    const { data: profiles } = await supabase
+      .from('profiles')
+      .select('id, username')
+      .in('id', ownerIds);
+
+    const profileMap = new Map(profiles?.map(p => [p.id, p.username]) || []);
+
+    const songsWithProfiles = songs?.map(song => ({
+      ...song,
+      profiles: { username: profileMap.get(song.owner_id) }
+    })) || [];
+
+    return res.json(songsWithProfiles);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -1376,6 +1392,260 @@ router.get('/:id/stats', authMiddleware, async (req: AuthRequest, res: Response)
       comments_count: commentsCount || 0,
       collaborators_count: collaboratorsCount || 0,
     });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// =============================================
+// LIKES
+// =============================================
+
+// POST /api/songs/:id/like - Like a song
+router.post('/:id/like', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+
+    // Check if song exists and is public
+    const { data: song, error: songError } = await supabase
+      .from('songs')
+      .select('id, owner_id, is_public')
+      .eq('id', req.params.id)
+      .single();
+
+    if (songError || !song) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    // Check if user has access (owner, collaborator, or public)
+    const isOwner = song.owner_id === req.userId;
+    let hasAccess = song.is_public || isOwner;
+
+    if (!hasAccess) {
+      const { data: collab } = await supabase
+        .from('collaborators')
+        .select('permission')
+        .eq('song_id', req.params.id)
+        .eq('user_id', req.userId)
+        .single();
+      hasAccess = !!collab;
+    }
+
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Check if already liked
+    const { data: existingLike } = await supabaseAuth
+      .from('song_likes')
+      .select('id')
+      .eq('song_id', req.params.id)
+      .eq('user_id', req.userId)
+      .single();
+
+    if (existingLike) {
+      return res.status(400).json({ error: 'Already liked' });
+    }
+
+    // Add like
+    const { error: likeError } = await supabaseAuth
+      .from('song_likes')
+      .insert({
+        song_id: req.params.id,
+        user_id: req.userId,
+      });
+
+    if (likeError) {
+      return res.status(400).json({ error: likeError.message });
+    }
+
+    // Update likes_count
+    try {
+      await supabase.rpc('increment_likes_count', { song_id: req.params.id });
+    } catch {}
+
+    return res.status(201).json({ success: true });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/songs/:id/like - Unlike a song
+router.delete('/:id/like', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+
+    // Check if like exists
+    const { data: existingLike, error: likeError } = await supabaseAuth
+      .from('song_likes')
+      .delete()
+      .eq('song_id', req.params.id)
+      .eq('user_id', req.userId)
+      .select()
+      .single();
+
+    if (likeError || !existingLike) {
+      return res.status(404).json({ error: 'Like not found' });
+    }
+
+    // Update likes_count
+    try {
+      await supabase.rpc('decrement_likes_count', { song_id: req.params.id });
+    } catch {}
+
+    return res.json({ success: true });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/songs/:id/likes - Get like count and user liked status
+router.get('/:id/likes', async (req: AuthRequest, res: Response) => {
+  try {
+    const { data: song, error: songError } = await supabase
+      .from('songs')
+      .select('likes_count')
+      .eq('id', req.params.id)
+      .single();
+
+    if (songError || !song) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    let userLiked = false;
+    if (req.userId) {
+      const supabaseAuth = getSupabaseWithAuth(req);
+      const { data: like } = await supabaseAuth
+        .from('song_likes')
+        .select('id')
+        .eq('song_id', req.params.id)
+        .eq('user_id', req.userId)
+        .single();
+      userLiked = !!like;
+    }
+
+    return res.json({
+      likes_count: song.likes_count || 0,
+      user_liked: userLiked,
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/songs/liked - Get songs liked by user
+router.get('/liked', authMiddleware, async (req: AuthRequest, res: Response) => {
+  if (!req.userId) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    const supabaseAuth = getSupabaseWithAuth(req);
+
+    const { data, error } = await supabaseAuth
+      .from('song_likes')
+      .select('song_id, songs(*)')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    const songs = data?.map((d: any) => d.songs).filter(Boolean) || [];
+    return res.json(songs);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// =============================================
+// USER PROFILES
+// =============================================
+
+// GET /api/users/:username - Get user profile
+router.get('/users/:username', async (req: AuthRequest, res: Response) => {
+  try {
+    const { username } = req.params;
+
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('id, username, avatar_url, bio, created_at')
+      .eq('username', username)
+      .single();
+
+    if (profileError || !profile) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Get song counts
+    const { count: songsCount } = await supabase
+      .from('songs')
+      .select('*', { count: 'exact', head: true })
+      .eq('owner_id', profile.id)
+      .eq('is_public', true);
+
+    const { count: forksCount } = await supabase
+      .from('songs')
+      .select('*', { count: 'exact', head: true })
+      .eq('owner_id', profile.id)
+      .eq('is_public', true)
+      .not('parent_song_id', 'is', null);
+
+    const { count: likesCount } = await supabase
+      .from('song_likes')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', profile.id);
+
+    return res.json({
+      ...profile,
+      stats: {
+        songs: songsCount || 0,
+        forks: forksCount || 0,
+        likes: likesCount || 0,
+      },
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/users/:username/songs - Get user's public songs
+router.get('/users/:username/songs', async (req: AuthRequest, res: Response) => {
+  try {
+    const { username } = req.params;
+    const { limit = 20, offset = 0 } = req.query;
+
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('username', username)
+      .single();
+
+    if (profileError || !profile) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const { data: songs, error: songsError } = await supabase
+      .from('songs')
+      .select('*')
+      .eq('owner_id', profile.id)
+      .eq('is_public', true)
+      .order('created_at', { ascending: false })
+      .range(Number(offset), Number(offset) + Number(limit) - 1);
+
+    if (songsError) {
+      return res.status(400).json({ error: songsError.message });
+    }
+
+    return res.json(songs || []);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
