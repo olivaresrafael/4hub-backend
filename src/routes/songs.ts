@@ -1675,4 +1675,69 @@ export async function createNotification(
   return { data, error };
 }
 
+// =============================================
+// ACTIVITY FEED
+// =============================================
+
+// GET /api/activity - Global activity feed
+router.get('/activity/feed', async (req: AuthRequest, res: Response) => {
+  try {
+    const { limit = 20, offset = 0 } = req.query;
+
+    // Get recent songs
+    const { data: recentSongs } = await supabase
+      .from('songs')
+      .select('id, title, created_at, owner_id, is_public, parent_song_id')
+      .eq('is_public', true)
+      .order('created_at', { ascending: false })
+      .range(Number(offset), Number(offset) + Number(limit) - 1);
+
+    if (!recentSongs || recentSongs.length === 0) {
+      return res.json([]);
+    }
+
+    // Get owner profiles
+    const ownerIds = [...new Set(recentSongs.map(s => s.owner_id))];
+    const { data: profiles } = await supabase
+      .from('profiles')
+      .select('id, username, avatar_url')
+      .in('id', ownerIds);
+
+    const profileMap = new Map(profiles?.map(p => [p.id, p]) || []);
+
+    // Get parent songs for forks
+    const parentIds = [...new Set(recentSongs.map(s => s.parent_song_id).filter(Boolean))];
+    let parentMap = new Map();
+    if (parentIds.length > 0) {
+      const { data: parentSongs } = await supabase
+        .from('songs')
+        .select('id, title')
+        .in('id', parentIds);
+      parentMap = new Map(parentSongs?.map(p => [p.id, p]) || []);
+    }
+
+    // Build activity feed
+    const activity = recentSongs.map(song => {
+      const owner = profileMap.get(song.owner_id);
+      const parent = song.parent_song_id ? parentMap.get(song.parent_song_id) : null;
+
+      return {
+        id: song.id,
+        type: song.parent_song_id ? 'fork' : 'new',
+        song_title: song.title,
+        song_id: song.id,
+        user_id: song.owner_id,
+        username: owner?.username || 'Unknown',
+        avatar_url: owner?.avatar_url || null,
+        parent_song: parent ? { id: parent.id, title: parent.title } : null,
+        created_at: song.created_at,
+      };
+    });
+
+    return res.json(activity);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 export default router;
