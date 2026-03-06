@@ -1241,43 +1241,33 @@ router.delete('/:id/comments/:commentId', authMiddleware, async (req: AuthReques
 // =============================================
 
 // GET /api/songs/:id/activity - Get activity log for a song
-router.get('/:id/activity', authMiddleware, async (req: AuthRequest, res: Response) => {
-  if (!req.userId) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
+router.get('/:id/activity', async (req: AuthRequest, res: Response) => {
   try {
-    const supabaseAuth = getSupabaseWithAuth(req);
+    const { id } = req.params;
     
-    const { data: song, error: songError } = await supabaseAuth
+    const { data: song, error: songError } = await supabase
       .from('songs')
-      .select('owner_id')
-      .eq('id', req.params.id)
+      .select('owner_id, is_public')
+      .eq('id', id)
       .single();
 
     if (songError || !song) {
       return res.status(404).json({ error: 'Song not found' });
     }
 
-    const isOwner = song.owner_id === req.userId;
+    // Check access - owner can always view, or public songs are viewable
+    const isOwner = req.userId && song.owner_id === req.userId;
+    const isPublic = song.is_public;
     
-    const { data: collab } = await supabaseAuth
-      .from('collaborators')
-      .select('permission')
-      .eq('song_id', req.params.id)
-      .eq('user_id', req.userId)
-      .single();
-
-    const canView = isOwner || (collab && ['edit', 'admin'].includes(collab.permission));
-
-    if (!canView) {
+    if (!isOwner && !isPublic) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { data, error } = await supabaseAuth
+    // Get activity without join
+    const { data: activity, error } = await supabase
       .from('activity_log')
-      .select('*, profiles(username)')
-      .eq('song_id', req.params.id)
+      .select('*')
+      .eq('song_id', id)
       .order('created_at', { ascending: false })
       .limit(20);
 
@@ -1285,7 +1275,26 @@ router.get('/:id/activity', authMiddleware, async (req: AuthRequest, res: Respon
       return res.status(400).json({ error: error.message });
     }
 
-    return res.json(data || []);
+    // Get user profiles manually
+    const userIds = [...new Set(activity?.map((a: any) => a.user_id).filter(Boolean) || [])];
+    let profiles: { id: string; username: string }[] = [];
+    if (userIds.length > 0) {
+      const { data: profileData } = await supabase
+        .from('profiles')
+        .select('id, username')
+        .in('id', userIds);
+      profiles = profileData || [];
+    }
+
+    const profileMap = new Map(profiles.map(p => [p.id, p]));
+
+    // Attach profiles to activity
+    const activityWithProfiles = activity?.map(item => ({
+      ...item,
+      profiles: profileMap.get(item.user_id) || null
+    })) || [];
+
+    return res.json(activityWithProfiles);
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
   }
@@ -1354,37 +1363,37 @@ router.post('/:id/view', async (req: AuthRequest, res: Response) => {
 });
 
 // GET /api/songs/:id/stats - Get song statistics
-router.get('/:id/stats', authMiddleware, async (req: AuthRequest, res: Response) => {
-  if (!req.userId) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
+router.get('/:id/stats', async (req: AuthRequest, res: Response) => {
   try {
-    const supabaseAuth = getSupabaseWithAuth(req);
+    const { id } = req.params;
     
-    const { data: song, error: songError } = await supabaseAuth
+    const { data: song, error: songError } = await supabase
       .from('songs')
-      .select('owner_id, view_count, share_count')
-      .eq('id', req.params.id)
+      .select('owner_id, view_count, share_count, is_public')
+      .eq('id', id)
       .single();
 
     if (songError || !song) {
       return res.status(404).json({ error: 'Song not found' });
     }
 
-    if (song.owner_id !== req.userId) {
+    // Check access - owner can always view, or public songs are viewable
+    const isOwner = req.userId && song.owner_id === req.userId;
+    const isPublic = song.is_public;
+    
+    if (!isOwner && !isPublic) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { data: commentsCount } = await supabase
+    const { count: commentsCount } = await supabase
       .from('comments')
-      .select('id', { count: 'exact', head: true })
-      .eq('song_id', req.params.id);
+      .select('*', { count: 'exact', head: true })
+      .eq('song_id', id);
 
-    const { data: collaboratorsCount } = await supabase
+    const { count: collaboratorsCount } = await supabase
       .from('collaborators')
-      .select('id', { count: 'exact', head: true })
-      .eq('song_id', req.params.id);
+      .select('*', { count: 'exact', head: true })
+      .eq('song_id', id);
 
     return res.json({
       view_count: song.view_count || 0,
@@ -1575,14 +1584,47 @@ router.get('/users/:username', async (req: AuthRequest, res: Response) => {
   try {
     const { username } = req.params;
 
-    const { data: profile, error: profileError } = await supabase
+    // Try to extract userId from auth header if present
+    let userId: string | undefined;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const jwt = await import('jsonwebtoken');
+        const token = authHeader.split(' ')[1];
+        const decoded = jwt.default.decode(token) as { sub?: string };
+        userId = decoded?.sub;
+      } catch (e) {
+        // Ignore token decode errors
+      }
+    }
+
+    const { data: existingProfile, error: profileError } = await supabase
       .from('profiles')
       .select('id, username, avatar_url, bio, created_at')
       .eq('username', username)
       .single();
 
-    if (profileError || !profile) {
-      return res.status(404).json({ error: 'User not found' });
+    let profile = existingProfile;
+
+    if (!profile && userId) {
+      // If profile doesn't exist and user is authenticated, create the profile
+      const supabaseAuth = getSupabaseWithAuth(req);
+      const { data: newProfile, error: createError } = await supabaseAuth
+        .from('profiles')
+        .insert({
+          id: userId,
+          username: username,
+        })
+        .select()
+        .single();
+
+      if (!createError && newProfile) {
+        profile = newProfile;
+      }
+    }
+
+    if (!profile) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
     // Get song counts
@@ -1727,7 +1769,7 @@ router.get('/activity/feed', async (req: AuthRequest, res: Response) => {
         song_title: song.title,
         song_id: song.id,
         user_id: song.owner_id,
-        username: owner?.username || 'Unknown',
+        username: owner?.username || 'Usuario',
         avatar_url: owner?.avatar_url || null,
         parent_song: parent ? { id: parent.id, title: parent.title } : null,
         created_at: song.created_at,
